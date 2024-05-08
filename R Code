@@ -1,0 +1,347 @@
+## Packages
+
+library(baseballr)
+library(tidyverse)
+library(mlogit)
+library(spatstat.geom)
+library(grplasso)
+library(caret)
+
+## Statcast scraper
+
+annual_statcast_query <- function(season) { 
+dates <- seq.Date(as.Date(paste0(season, '-03-30')),
+as.Date(paste0(season, '-10-01')), by = 'week')
+date_grid <- tibble(start_date = dates, end_date = dates + 6)
+safe_savant <- safely(scrape_statcast_savant)
+payload <- map(.x = seq_along(date_grid$start_date), 
+~{message(paste0('\nScraping week of ', 
+date_grid$start_date[.x], '...\n'))               
+payload <- safe_savant(start_date = 
+date_grid$start_date[.x], 
+end_date = date_grid$end_date[.x], type = 'pitcher')
+return(payload)
+})
+  
+payload_df <- map(payload, 'result')
+number_rows <- map_df(.x = seq_along(payload_df), 
+~{number_rows <- tibble(week = .x, 
+number_rows = length(payload_df[[.x]]$game_date))}) %>%
+filter(number_rows > 0) %>% pull(week)
+payload_df_reduced <- payload_df[number_rows]  
+combined <- payload_df_reduced %>% bind_rows()
+return(combined)  
+}
+
+dat <- annual_statcast_query(2023)
+
+## Data Cleaning and Viz
+
+saveRDS(dat,file="2023.rds")
+dat <- readRDS(file="2023.rds")
+
+dataset <- subset(dat,description == "ball" | 
+description == "called_strike" | description == "blocked_ball")
+dataset <- 
+dataset[,c(1:3,10,15,18:22,25,26,28:31,35:37,45:52,57,77:81)]
+df <- dataset %>%
+mutate(correct_call = case_when(zone %in% c(1:9) & type == "S" ~ 1,
+zone %in% c(11:14) & type == "B" ~ 1,
+zone %in% c(1:9) & type == "B" ~ 0,
+zone %in% c(11:14) & type == "S" ~ 0))
+
+ggplot(df)+geom_point(aes(x=plate_x,y=plate_z,
+color=as.factor(correct_call)))+facet_wrap(vars(pitch_name))
+
+table(df$pitch_type)
+common_pitches <- 
+subset(df, pitch_type %in% c("CH","CU","FC","FF","SI","SL","ST"))
+
+common_pitches %>% filter(!is.na(correct_call), type == "S") %>% 
+mutate(correct_call = 
+ifelse(correct_call == "1", "Correct","Incorrect")) %>% 
+ggplot(aes(x=plate_x,y=plate_z))+
+geom_point(aes(color=as.factor(correct_call)),alpha=.1)+
+scale_colour_manual(values=c("lightgreen","red"))+
+facet_wrap(vars(pitch_name))+xlim(-1,1)+ylim(1,4)+
+labs(title="Plot of All Strike Calls by Correctness and Pitch Type",
+x="Horizontal Location",y="Vertical Location",color="Correct Call")+ 
+guides(colour = guide_legend(override.aes = list(alpha = 1)))
+common_pitches %>% filter(!is.na(correct_call), type == "B") %>% 
+mutate(correct_call = 
+ifelse(correct_call == "0", "Incorrect","Correct")) %>% 
+ggplot(aes(x=plate_x,y=plate_z))+
+geom_point(aes(color=as.factor(correct_call)),alpha=.1)+
+scale_colour_manual(values=c("lightgreen","red"))+
+facet_wrap(vars(pitch_name))+xlim(-1,1)+ylim(1,4)+
+labs(title="Plot of All Ball Calls by Correctness and Pitch Type",
+x="Horizontal Location",y="Vertical Location",color="Correct Call")+
+guides(colour = guide_legend(override.aes = list(alpha = 1)))
+
+ggplot(common_pitches)+geom_point(aes(x=plate_x,y=plate_z,
+color=as.factor(correct_call)))+facet_wrap(vars(inning))
+ggplot(common_pitches)+geom_point(aes(x=plate_x,y=plate_z,
+color=as.factor(correct_call)))+facet_wrap(vars(zone))
+
+common_pitches <- common_pitches %>%
+mutate(combo = case_when(stand == "R" & p_throws == "R" ~ "RR",
+stand == "R" & p_throws == "L" ~ "RL",
+stand == "L" & p_throws == "R" ~ "LR",
+stand == "L" & p_throws == "L" ~ "LL"))
+
+common_pitches %>% filter(!is.na(correct_call), type == "S") %>%
+mutate(correct_call = 
+ifelse(correct_call == "0", "Incorrect","Correct")) %>% 
+ggplot(aes(x=plate_x,y=plate_z))+
+geom_point(aes(color=as.factor(correct_call)),alpha=.1)+
+scale_colour_manual(values=c("lightgreen","red"))+
+facet_wrap(vars(combo))+
+labs(title="Plot of All Strike Calls by Batter-Pitcher
+Combination and Correctness",x="Horizontal Location",
+y="Vertical Location",color="Correct Call")+ 
+guides(colour = guide_legend(override.aes = list(alpha = 1)))
+common_pitches %>% filter(!is.na(correct_call), type == "B") %>% 
+mutate(correct_call = 
+ifelse(correct_call == "0", "Incorrect","Correct")) %>% 
+ggplot(aes(x=plate_x,y=plate_z))+
+geom_point(aes(color=as.factor(correct_call)),alpha=.1)+
+scale_colour_manual(values=c("lightgreen","red"))+
+facet_wrap(vars(combo))+
+labs(title="Plot of All Ball Calls by Batter-Pitcher 
+Combination and Correctness",x="Horizontal Location",
+y="Vertical Location",color="Correct Call")+
+xlim(-2.5,2.5)+ylim(0,5)+ 
+guides(colour = guide_legend(override.aes = list(alpha = 1)))
+
+ggplot(subset(common_pitches,type=="S"))+
+geom_point(aes(x=plate_x,y=plate_z,color=as.factor(correct_call)))+
+facet_wrap(~pitch_name+combo)
+ggplot(subset(common_pitches,type=="B"))+
+geom_point(aes(x=plate_x,y=plate_z,color=as.factor(correct_call)))+
+facet_wrap(~pitch_type+combo)
+
+zone_correct <- aggregate(correct_call ~ zone, 
+data=common_pitches, sum)
+zone_count <- common_pitches %>% group_by(zone) %>% tally()
+zone_count <- zone_count[-14,]
+zone_combined <- data.frame(zone_correct[,2],zone_count[,2])
+colnames(zone_combined) <- c("correct_calls", "total_pitches")
+percentage_correct <- 
+data.frame(round(zone_combined$correct_calls /
+zone_combined$total_pitches,4),c(1:9,11:14))
+colnames(percentage_correct) <- 
+c("percentage_correct","MLB_Gameday_Zone")
+
+common_pitches <- common_pitches %>%
+mutate(score_difference = abs(home_score - away_score))
+common_pitches <- common_pitches %>%
+mutate(pitch_count = case_when(balls == 0 & strikes == 0 ~ "0-0",
+balls == 0 & strikes == 1 ~ "0-1",
+balls == 0 & strikes == 2 ~ "0-2",
+balls == 1 & strikes == 0 ~ "1-0",
+balls == 2 & strikes == 0 ~ "2-0",
+balls == 3 & strikes == 0 ~ "3-0",
+balls == 1 & strikes == 1 ~ "1-1",
+balls == 2 & strikes == 1 ~ "2-1",
+balls == 3 & strikes == 1 ~ "3-1",
+balls == 1 & strikes == 2 ~ "1-2",
+balls == 2 & strikes == 2 ~ "2-2",
+balls == 3 & strikes == 2 ~ "3-2"))
+
+ggplot(common_pitches)+geom_point(aes(x=plate_x,y=plate_z,
+shape=combo,color=as.factor(correct_call),alpha=.05))+
+facet_wrap(~pitch_name)+coord_fixed(ratio=1)
+
+common_pitches <- common_pitches %>%
+mutate(zone = as.factor(zone))
+common_pitches <- common_pitches %>%
+mutate(umpire_truth = \
+case_when(type == "B" & correct_call == 1  ~ "BB",
+type == "B" & correct_call == 0 ~ "BS",
+type == "S" & correct_call == 1 ~ "SS",
+type == "S" & correct_call == 0 ~ "SB"))
+
+common_pitches <- common_pitches[complete.cases
+(common_pitches[,c(5,15,16,18,19,31,34,35,36,37)]),]
+
+mean(common_pitches$umpire_truth %in% c("BB", "SB") 
+& common_pitches$zone %in% c(1:9))
+mean(common_pitches$umpire_truth %in% c("BS", "SS") 
+& common_pitches$zone %in% c(11:14))
+
+distance_from_center <- as.numeric(0)
+for (i in 1:nrow(common_pitches)){
+distance_from_center[i] = crossdist(common_pitches$plate_x[i],
+common_pitches$plate_z[i],0,mean(c(common_pitches$sz_top[i],
+common_pitches$sz_bot[i])))
+}
+common_pitches <- cbind(common_pitches,distance_from_center)
+
+strike_truth <- common_pitches[common_pitches$zone %in% c(1:9),]
+distance_from_edge <- as.numeric(0)
+for(i in 1:nrow(strike_truth)){
+distance_from_edge[i] = min(abs(strike_truth$plate_x[i]-.83),
+abs(strike_truth$plate_x[i]-(-.83)),
+abs(strike_truth$plate_z[i]-strike_truth$sz_top[i]),
+abs(strike_truth$plate_z[i]-strike_truth$sz_bot[i]))
+}
+
+strike_truth <- cbind(strike_truth,distance_from_edge)
+ball_truth <- common_pitches[common_pitches$zone %in% c(11:14),]
+ball_truth <- ball_truth %>%
+mutate(sz_left =
+rep(-.83,nrow(ball_truth)))
+ball_truth <- ball_truth %>%
+mutate(sz_right = rep(.83,nrow(ball_truth)))
+dist.fun = function(vec.in){
+crossdist(vec.in[1], vec.in[2], vec.in[3], vec.in[4])
+}
+ball_truth = ball_truth %>%
+mutate(ball_distance_from_edge =
+case_when(plate_z > sz_top & plate_x < sz_left ~ 
+apply(cbind(plate_x,plate_z,sz_left,sz_top), 1, dist.fun),
+plate_z > sz_top & plate_x > sz_right ~ 
+apply(cbind(plate_x,plate_z,sz_right,sz_top), 1, dist.fun),
+plate_z > sz_top & plate_x >= sz_left & plate_x <= sz_right ~
+plate_z-sz_top,
+plate_z < sz_bot & plate_x < sz_left ~ 
+apply(cbind(plate_x,plate_z,sz_left,sz_bot), 1, dist.fun),
+plate_z < sz_bot & plate_x > sz_right ~ 
+apply(cbind(plate_x,plate_z,sz_right,sz_bot), 1, dist.fun),
+plate_z < sz_bot & plate_x >= sz_left & plate_x <= sz_right ~ 
+sz_bot-plate_z,
+plate_x <= sz_left & plate_z <= sz_top & plate_z >= sz_bot ~
+sz_left-plate_x,
+plate_x >= sz_right & plate_z <= sz_top & plate_z >= sz_bot ~
+plate_x-sz_right))
+
+topbot_correct <- aggregate(correct_call ~ inning_topbot,
+data=strike_truth, sum)
+topbot_count <- strike_truth %>% group_by(inning_topbot) %>% tally()
+topbot_correct1 <- aggregate(correct_call ~ inning_topbot, 
+data=ball_truth, sum)
+topbot_count1 <- ball_truth %>% group_by(inning_topbot) %>% tally()
+tscb <- 1-(topbot_correct[,2]/topbot_count[,2])
+tbcs <- 1-(topbot_correct1[,2]/topbot_count1[,2])
+error_rate <- cbind(tscb,tbcs)
+row.names(error_rate) <- c("Bottom of Inning","Top of Inning")
+colnames(error_rate) <- c("True Strikes Called Balls",
+"True Balls Called Strikes")
+
+inside_dat <- subset(ball_truth, (plate_x < 0 & stand == "R") |
+(plate_x > 0 & stand == "L")) 
+outside_dat <- subset(ball_truth, (plate_x < 0 & stand == "L") |
+(plate_x > 0 & stand == "R"))
+table(inside_dat$correct_call)
+3326/(3326+70240)
+table(outside_dat$correct_call)
+8121/(8121+118025)
+
+## Group Lasso cross validation
+
+## Strikes -----------------------------------------------------------
+
+trainIndex <- createFolds(strike_truth$correct_call,k=5)
+lambda.range <- seq(7.1,8,length.out=10)
+lambda.range <- sort(lambda.range,decreasing=T)
+pred.mat <- matrix(NA, nrow = nrow(strike_truth), 
+ncol = length(lambda.range))
+for(fold.ind in 1:5){
+test.tmp <- strike_truth[trainIndex[[fold.ind]],]
+train.tmp <- strike_truth[-trainIndex[[fold.ind]],]
+model.fit <- grplasso(correct_call~release_speed+outs_when_up+
+inning+inning_topbot+release_spin_rate+at_bat_number+combo+
+score_difference+pitch_count+distance_from_center+zone+pitch_name+
+zone*pitch_name,data=train.tmp,lambda=lambda.range)
+pred.mat[trainIndex[[fold.ind]],]=
+predict(newdata=test.tmp,type="response",model.fit)
+print(fold.ind)
+}
+
+cv.vec = rep(NA, length(lambda.range))
+for(j in 1:length(lambda.range)){
+cv.vec[j] = mean((pred.mat[,j]-strike_truth$correct_call)^2)
+}
+
+plot(cv.vec ~ lambda.range)
+
+## Min lambda = 7.8
+final.fit.strikes = grplasso(correct_call~release_speed+outs_when_up+
+inning+inning_topbot+release_spin_rate+at_bat_number+combo+
+score_difference+pitch_count+distance_from_center+zone+pitch_name+
+zone*pitch_name,data=strike_truth,lambda=7.8)
+strike_coef <- as.data.frame(coef(final.fit.strikes))
+names <- rownames(strike_coef)
+strike_coef <- cbind(names,strike_coef[,1])
+colnames(strike_coef) <- c("factor","value")
+strike_coef <- data.frame(strike_coef)
+strike_coef$value <- as.numeric(strike_coef$value)
+library(tidyverse)
+ggplot(data=strike_coef,aes(x=factor,y=value))+
+geom_bar(stat="identity")+coord_flip()
+
+new_dat <- strike_truth 
+new_dat$pitch_name = "4-Seam Fastball"
+new_dat$combo = "RR"
+new_dat$pitch_count = "3-2"
+y_hat <- predict(newdata=new_dat,type="response",final.fit.strikes)
+new_dat$pred <- y_hat
+
+new_dat1 <- strike_truth 
+new_dat1$pitch_name = "4-Seam Fastball"
+new_dat1$combo = "RR"
+new_dat1$pitch_count = "3-0"
+y_hat1 <- predict(newdata=new_dat1,type="response",final.fit.strikes)
+new_dat1$pred <- y_hat1
+
+ggplot(new_dat,aes(x=plate_x,y=plate_z))+geom_point(aes(color=pred),
+alpha=.1)+labs(title=
+"Probability of Correctly Calling a Strike (3-2 Count Fastball)",
+x="Horizontal Location",y="Vertical Location",
+color="Probability of Correct Call")+xlim(-1.5,1.5)+ylim(1,4)
+ggplot(new_dat1,aes(x=plate_x,y=plate_z))+geom_point(aes(color=pred),
+alpha=.1)+labs(title=
+"Probability of Correctly Calling a Strike (3-0 Count Fastball)",
+x="Horizontal Location",y="Vertical Location",
+color="Probability of Correct Call")+xlim(-1.5,1.5)+ylim(1,4)
+
+# Balls --------------------------------------------------------------
+rm(list=ls())
+trainIndex <- createFolds(ball_truth$correct_call,k=5)
+lambda.range <- seq(31,32,length.out=10)
+lambda.range <- sort(lambda.range,decreasing=T)
+pred.mat <- matrix(NA, nrow = nrow(ball_truth), 
+ncol = length(lambda.range))
+for(fold.ind in 1:5){
+test.tmp <- ball_truth[trainIndex[[fold.ind]],]
+train.tmp <- ball_truth[-trainIndex[[fold.ind]],]
+model.fit <- grplasso(correct_call~release_speed+outs_when_up+inning+
+inning_topbot+release_spin_rate+at_bat_number+combo+score_difference+
+pitch_count+distance_from_center+zone+pitch_name+
+zone*pitch_name,data=train.tmp,lambda=lambda.range)
+pred.mat[trainIndex[[fold.ind]],]=predict(newdata=test.tmp,
+type="response",model.fit)
+print(fold.ind)
+}
+
+cv.vec = rep(NA, length(lambda.range))
+for(j in 1:length(lambda.range)){
+cv.vec[j] = mean((pred.mat[,j]-ball_truth$correct_call)^2)
+}
+
+plot(cv.vec ~ lambda.range)
+
+## Min lambda = 31.8.
+final.fit.balls = grplasso(correct_call~release_speed+outs_when_up+
+inning+inning_topbot+release_spin_rate+at_bat_number+combo+
+score_difference+pitch_count+distance_from_center+zone+pitch_name+
+zone*pitch_name,data=ball_truth,lambda=31.8)
+                       
+ball_coef <- as.data.frame(coef(final.fit,balls))
+names <- rownames(ball_coef)
+ball_coef <- cbind(names,ball_coef[,1])
+colnames(ball_coef) <- c("factor","value")
+ball_coef <- data.frame(ball_coef)
+ball_coef$value <- as.numeric(ball_coef$value)
+ggplot(data=ball_coef,aes(x=factor,y=value))+
+geom_bar(stat="identity")+coord_flip()
